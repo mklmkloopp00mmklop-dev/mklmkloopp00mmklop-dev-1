@@ -1,0 +1,113 @@
+الاسم: RDP
+
+على:
+  workflow_dispatch:
+
+الوظائف:
+  بروتوكول سطح المكتب البعيد الآمن:
+    يعمل على: أحدث إصدار من نظام التشغيل ويندوز
+    مهلة زمنية بالدقائق: 3600
+
+    خطوات:
+      - الاسم: تكوين إعدادات RDP الأساسية
+        تشغيل: |
+          # قم بتمكين سطح المكتب البعيد وتعطيل مصادقة مستوى الشبكة (إذا لزم الأمر)
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
+                             -الاسم "fDenyTSConnections" -القيمة 0 -فرض
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+                             -الاسم "UserAuthentication" -القيمة 0 -فرض
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+                             -الاسم "طبقة الأمان" -القيمة 0 -فرض
+
+          # قم بإزالة أي قاعدة موجودة بنفس الاسم لتجنب التكرار
+          netsh advfirewall firewall delete rule name="RDP-Tailscale"
+          
+          # لأغراض الاختبار، اسمح بأي اتصال وارد على المنفذ 3389
+          netsh advfirewall firewall add rule name="RDP-Tailscale" `
+            dir=in action=allow protocol=TCP localport=3389
+
+          # (اختياري) أعد تشغيل خدمة سطح المكتب البعيد لضمان تطبيق التغييرات
+          أعد تشغيل الخدمة - الاسم TermService - بالقوة
+
+      - الاسم: إنشاء مستخدم RDP بكلمة مرور آمنة
+        تشغيل: |
+          أضف النوع -اسم التجميع System.Security
+          $charSet = @{
+              Upper = [char[]](65..90) # AZ
+              Lower = [char[]](97..122) # az
+              الرقم = [char[]](48..57) # 0-9
+              الخاص = ([char[]](33..47) + [char[]](58..64) +
+                         [char[]](91..96) + [char[]](123..126)) # أحرف خاصة
+          }
+          $rawPassword = @()
+          $rawPassword += $charSet.Upper | Get-Random -Count 4
+          $rawPassword += $charSet.Lower | Get-Random -Count 4
+          $rawPassword += $charSet.Number | Get-Random -Count 4
+          $rawPassword += $charSet.Special | Get-Random -Count 4
+          $password = -join ($rawPassword | Sort-Object { Get-Random })
+          $securePass = ConvertTo-SecureString $password -AsPlainText -Force
+          إنشاء مستخدم محلي جديد باسم "RDP" وكلمة مرور $securePass مع ضمان عدم انتهاء صلاحية الحساب.
+          Add-LocalGroupMember -Group "Administrators" -member "RDP"
+          Add-LocalGroupMember -Group "Remote Desktop Users" -Member "RDP"
+          
+          echo "RDP_CREDS=User: RDP | Password: $password" >> $env:GITHUB_ENV
+          
+          إذا لم يكن اسم المستخدم المحلي هو "RDP"،
+              خطأ في الكتابة: "فشل إنشاء المستخدم"
+              المخرج 1
+          }
+
+      - الاسم: تثبيت مقياس الذيل
+        تشغيل: |
+          $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi"
+          $installerPath = "$env:TEMP\tailscale.msi"
+          
+          Invoke-WebRequest -Uri $tsUrl -OutFile $installerPath
+          بدء تشغيل العملية msiexec.exe مع تحديد قائمة الوسائط "/i", ""$installerPath"", "/quiet", "/norestart" -انتظار
+          Remove-Item $installerPath -Force
+
+      - الاسم: إنشاء اتصال بمقياس الذيل
+        تشغيل: |
+          # قم بتشغيل Tailscale باستخدام مفتاح المصادقة المقدم وقم بتعيين اسم مضيف فريد
+          & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=gh-runner-$env:GITHUB_RUN_ID
+          
+          # انتظر حتى يقوم Tailscale بتخصيص عنوان IP
+          $tsIP = $null
+          عدد المحاولات = 0
+          بينما (ليس $tsIP -و عدد المحاولات -أقل من 10) {
+              $tsIP = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4
+              بدء وضع السكون - 5 ثوانٍ
+              $retries++
+          }
+          
+          إذا لم يكن عنوان IP الخاص بـ ts هو $tsIP {
+              خطأ في الكتابة: "لم يتم تخصيص عنوان IP الخاص بـ Tailscale. جارٍ الخروج."
+              المخرج 1
+          }
+          echo "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
+      
+      - الاسم: التحقق من إمكانية الوصول إلى بروتوكول سطح المكتب البعيد (RDP)
+        تشغيل: |
+          Write-Host "Tailscale IP: $env:TAILSCALE_IP"
+          
+          # اختبار الاتصال باستخدام Test-NetConnection مقابل عنوان IP الخاص بـ Tailscale على المنفذ 3389
+          $testResult = Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port 3389
+          إذا لم تكن نتيجة اختبار Tcp ناجحة (-) {
+              خطأ في الكتابة: "فشل الاتصال ببروتوكول TCP بمنفذ RDP رقم 3389"
+              المخرج 1
+          }
+          اكتب للمضيف "تم الاتصال بنجاح عبر بروتوكول TCP!"
+
+      - الاسم: الحفاظ على الاتصال
+        تشغيل: |
+          اكتب المضيف "`n=== RDP ACCESS ==="
+          Write-Host "العنوان: $env:TAILSCALE_IP"
+          اكتب-المضيف "اسم المستخدم: RDP"
+          Write-Host "Password: $(echo $env:RDP_CREDS)"
+          Write-Host "==================`n"
+          
+          # أبقِ البرنامج نشطًا إلى أجل غير مسمى (أو حتى يتم إلغاؤه يدويًا)
+          بينما ($صحيح) {
+              Write-Host "[$(Get-Date)] RDP نشط - استخدم Ctrl+C في سير العمل لإنهاء العملية"
+              بدء وضع السكون - 300 ثانية
+          }
